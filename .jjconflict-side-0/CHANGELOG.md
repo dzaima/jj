@@ -527,6 +527,10 @@ Thanks to the people who made this release happen!
 * Conditional configuration based on environment variables with `--when.environments`.
   [#8779](https://github.com/jj-vcs/jj/pull/8779)
 
+* Added support `revsets.git-push` which allows you to customize the default
+  set of commits to push. See issue
+  [#3649](https://github.com/jj-vcs/jj/issues/3650).
+
 ### Fixed bugs
 
 * Windows: use native file locks (`LockFileEx`) instead of polling with file
@@ -1210,6 +1214,7 @@ Thanks to the people who made this release happen!
 * `jj file track` now accepts an `--include-ignored` flag to track files that
   are ignored by `.gitignore` or exceed the `snapshot.max-new-file-size` limit.
   [#2837](https://github.com/jj-vcs/jj/issues/2837)
+
 
 ### Fixed bugs
 

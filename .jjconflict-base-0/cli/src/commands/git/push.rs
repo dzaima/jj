@@ -29,7 +29,10 @@ use futures::future::try_join_all;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
+use jj_lib::commit::Commit;
 use jj_lib::config::ConfigGetResultExt as _;
+use jj_lib::dsl_util::ExpressionNode;
+use jj_lib::dsl_util::PatternNode;
 use jj_lib::git;
 use jj_lib::git::GitPushOptions;
 use jj_lib::git::GitPushRefTargets;
@@ -47,24 +50,33 @@ use jj_lib::refs::LocalAndRemoteRef;
 use jj_lib::refs::RefPushAction;
 use jj_lib::refs::classify_ref_push_action;
 use jj_lib::repo::Repo;
-use jj_lib::revset::RemoteRefSymbolExpression;
+use jj_lib::revset::ResolvedRevsetExpression;
+use jj_lib::revset::RevsetContainingFn;
+use jj_lib::revset::RevsetEvaluationError;
+use jj_lib::revset;
+use jj_lib::revset::ExpressionKind;
+use jj_lib::revset::RevsetDiagnostics;
 use jj_lib::revset::RevsetExpression;
+use jj_lib::revset::RevsetStreamExt as _;
 use jj_lib::revset::UserRevsetExpression;
 use jj_lib::rewrite::CommitRewriter;
 use jj_lib::signing::SignBehavior;
 use jj_lib::str_util::StringExpression;
 use jj_lib::view::View;
+use pest::Span;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
 use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::WorkspaceCommandTransaction;
 use crate::cli_util::has_tracked_remote_bookmarks;
+use crate::cli_util::has_tracked_remote_tags;
 use crate::cli_util::short_change_hash;
 use crate::cli_util::short_commit_hash;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
 use crate::command_error::cli_error_with_message;
+use crate::command_error::print_parse_diagnostics;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::commands::git::get_single_remote;
@@ -79,8 +91,8 @@ use crate::ui::Ui;
 
 /// Push to a Git remote
 ///
-/// By default, pushes tracking bookmarks pointing to
-/// `remote_bookmarks(remote=<remote>)..@`. Use `--bookmark` to push specific
+/// By default, pushes tracking bookmarks defined by the  
+/// `revsets.git-push` revset. Use `--bookmark` to push specific
 /// bookmarks. Use `--all` to push all bookmarks. Use `--change` to generate
 /// bookmark names based on the change IDs of specific commits.
 ///
@@ -109,8 +121,8 @@ use crate::ui::Ui;
 ///     https://docs.jj-vcs.dev/latest/bookmarks/#conflicts
 
 #[derive(clap::Args, Clone, Debug)]
-#[command(group(ArgGroup::new("specific").args(&["bookmark", "change", "revisions", "named"]).multiple(true)))]
-#[command(group(ArgGroup::new("what").args(&["all", "tracked"]).conflicts_with("specific")))]
+#[command(group(ArgGroup::new("specific").multiple(true)))]
+#[command(group(ArgGroup::new("what").conflicts_with("specific")))]
 pub struct GitPushArgs {
     /// The remote to push to (only named remotes are supported)
     ///
@@ -131,12 +143,26 @@ pub struct GitPushArgs {
     ///
     /// [string pattern syntax]:
     ///     https://docs.jj-vcs.dev/latest/revsets/#string-patterns
-    #[arg(long, short, alias = "branch")]
+    #[arg(long, short, alias = "branch", group = "specific")]
     #[arg(add = ArgValueCandidates::new(complete::local_bookmarks))]
     bookmark: Vec<String>,
 
+    /// Push only this tag, or tags matching a pattern (can be repeated)
+    ///
+    /// If a tag isn't tracking anything yet, the remote tag will be tracked
+    /// automatically.
+    ///
+    /// By default, the specified pattern matches tag names with glob syntax.
+    /// You can also use other [string pattern syntax].
+    ///
+    /// [string pattern syntax]:
+    ///     https://docs.jj-vcs.dev/latest/revsets/#string-patterns
+    #[arg(long, short, group = "specific")]
+    #[arg(hide = true)] // TODO: unhide when this gets stabilized (#7528)
+    tag: Vec<String>,
+
     /// Push all bookmarks (including new bookmarks)
-    #[arg(long)]
+    #[arg(long, group = "what")]
     all: bool,
 
     /// Push all tracked bookmarks
@@ -146,7 +172,7 @@ pub struct GitPushArgs {
     ///
     /// [relevant remote]:
     ///     https://docs.jj-vcs.dev/latest/bookmarks#remotes-and-tracked-bookmarks
-    #[arg(long)]
+    #[arg(long, group = "what")]
     tracked: bool,
 
     /// Push all deleted bookmarks
@@ -156,13 +182,6 @@ pub struct GitPushArgs {
     /// correspond to missing local bookmarks.
     #[arg(long, conflicts_with = "specific")]
     deleted: bool,
-
-    // TODO: Delete in jj 0.42.0+
-    /// Allow pushing new bookmarks
-    ///
-    /// Newly-created remote bookmarks will be tracked automatically.
-    #[arg(long, short = 'N', hide = true, conflicts_with = "what")]
-    allow_new: bool,
 
     /// Allow pushing commits with empty descriptions
     #[arg(long)]
@@ -177,7 +196,13 @@ pub struct GitPushArgs {
     allow_private: bool,
 
     /// Push bookmarks pointing to these commits (can be repeated)
-    #[arg(long = "revision", short, value_name = "REVSETS", alias = "revisions")]
+    #[arg(
+        long = "revision",
+        short,
+        group = "specific",
+        value_name = "REVSETS",
+        alias = "revisions"
+    )]
     // While `-r` will often be used with mutable revisions, immutable revisions
     // can be useful as parts of revsets or to push special-purpose branches.
     #[arg(add = ArgValueCompleter::new(complete::revset_expression_all))]
@@ -188,7 +213,7 @@ pub struct GitPushArgs {
     /// The created bookmark will be tracked automatically. Use the
     /// `templates.git_push_bookmark` setting to customize the generated
     /// bookmark name. The default is `"push-" ++ change_id.short()`.
-    #[arg(long, short, value_name = "REVSETS")]
+    #[arg(long, short, group = "specific", value_name = "REVSETS")]
     // I'm guessing that `git push -c` is almost exclusively used with recently
     // created mutable revisions, even though it can in theory be used with
     // immutable ones as well. We can change it if the guess turns out to be
@@ -200,7 +225,7 @@ pub struct GitPushArgs {
     /// '--named myfeature=@'
     ///
     /// Automatically tracks the bookmark if it is new.
-    #[arg(long, value_name = "NAME=REVISION")]
+    #[arg(long, group = "specific", value_name = "NAME=REVISION")]
     #[arg(add = ArgValueCompleter::new(complete::branch_name_equals_any_revision))]
     named: Vec<String>,
 
@@ -213,14 +238,22 @@ pub struct GitPushArgs {
     option: Vec<String>,
 }
 
-fn make_bookmark_term(updates: &[(RefNameBuf, Diff<Option<CommitId>>)]) -> String {
-    match updates {
-        [(name, _)] => format!("bookmark {}", name.as_symbol()),
-        _ => format!(
-            "bookmarks {}",
-            updates.iter().map(|(name, _)| name.as_symbol()).join(", ")
-        ),
-    }
+fn make_updates_term(ref_updates: &GitPushRefTargets) -> String {
+    let kind_updates = [
+        ("bookmark", "bookmarks", &ref_updates.bookmarks),
+        ("tag", "tags", &ref_updates.tags),
+    ];
+    kind_updates
+        .into_iter()
+        .filter_map(|(kind, kinds, refs)| match &**refs {
+            [] => None,
+            [(name, _)] => Some(format!("{kind} {}", name.as_symbol())),
+            _ => Some(format!(
+                "{kinds} {}",
+                refs.iter().map(|(name, _)| name.as_symbol()).join(", ")
+            )),
+        })
+        .join(", ")
 }
 
 const DEFAULT_REMOTE: &RemoteName = RemoteName::new("origin");
@@ -239,14 +272,7 @@ pub async fn cmd_git_push(
     command: &CommandHelper,
     args: &GitPushArgs,
 ) -> Result<(), CommandError> {
-    if args.allow_new {
-        writeln!(
-            ui.warning_default(),
-            "--allow-new is deprecated, track bookmarks manually or configure \
-             remotes.<name>.auto-track-bookmarks instead."
-        )?;
-    }
-    let mut workspace_command = command.workspace_helper(ui)?;
+    let mut workspace_command = command.workspace_helper(ui).await?;
 
     let default_remote;
     let remote = if let Some(name) = &args.remote {
@@ -259,70 +285,119 @@ pub async fn cmd_git_push(
     let mut tx = workspace_command.start_transaction();
     let view = tx.repo().view();
     let tx_description;
-    let mut bookmark_updates = vec![];
+    let mut ref_updates = GitPushRefTargets::default();
     if args.all {
+        let mut commits_validator =
+            CommitsValidator::new(ui, tx.base_workspace_helper(), remote, args)?;
         for (name, targets) in view.local_remote_bookmarks(remote) {
+            let remote_symbol = name.to_remote_symbol(remote);
             let allow_new = true; // implied by --all
-            match classify_bookmark_update(
-                name.to_remote_symbol(remote),
-                targets,
-                allow_new,
-                args.deleted,
-            ) {
-                Ok(Some(update)) => bookmark_updates.push((name.to_owned(), update)),
+            match classify_bookmark_update(remote_symbol, targets, allow_new, args.deleted) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.bookmarks.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_bookmark(ui, tx.base_workspace_helper(), name)?,
+                },
+                Ok(None) => {}
+                Err(reason) => reason.print(ui)?,
+            }
+        }
+        for (name, targets) in view.local_remote_tags(remote) {
+            let remote_symbol = name.to_remote_symbol(remote);
+            // TODO: push untracked tags when remote tags get stabilized (#7528)
+            let allow_new = false;
+            match classify_tag_update(remote_symbol, targets, allow_new, args.deleted) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.tags.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_tag(ui, tx.base_workspace_helper(), name)?,
+                },
                 Ok(None) => {}
                 Err(reason) => reason.print(ui)?,
             }
         }
         tx_description = format!(
-            "{TX_DESC_PUSH}all bookmarks to git remote {remote}",
+            "{TX_DESC_PUSH}all bookmarks/tags to git remote {remote}",
             remote = remote.as_symbol()
         );
     } else if args.tracked {
+        let mut commits_validator =
+            CommitsValidator::new(ui, tx.base_workspace_helper(), remote, args)?;
         for (name, targets) in view.local_remote_bookmarks(remote) {
             if !targets.remote_ref.is_tracked() {
                 continue;
             }
+            let remote_symbol = name.to_remote_symbol(remote);
             let allow_new = false; // doesn't matter
-            match classify_bookmark_update(
-                name.to_remote_symbol(remote),
-                targets,
-                allow_new,
-                args.deleted,
-            ) {
-                Ok(Some(update)) => bookmark_updates.push((name.to_owned(), update)),
+            match classify_bookmark_update(remote_symbol, targets, allow_new, args.deleted) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.bookmarks.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_bookmark(ui, tx.base_workspace_helper(), name)?,
+                },
+                Ok(None) => {}
+                Err(reason) => reason.print(ui)?,
+            }
+        }
+        for (name, targets) in view.local_remote_tags(remote) {
+            if !targets.remote_ref.is_tracked() {
+                continue;
+            }
+            let remote_symbol = name.to_remote_symbol(remote);
+            let allow_new = false; // doesn't matter
+            match classify_tag_update(remote_symbol, targets, allow_new, args.deleted) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.tags.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_tag(ui, tx.base_workspace_helper(), name)?,
+                },
                 Ok(None) => {}
                 Err(reason) => reason.print(ui)?,
             }
         }
         tx_description = format!(
-            "{TX_DESC_PUSH}all tracked bookmarks to git remote {remote}",
+            "{TX_DESC_PUSH}all tracked bookmarks/tags to git remote {remote}",
             remote = remote.as_symbol()
         );
     } else if args.deleted {
+        // There shouldn't be new heads to push, but we run validation for consistency.
+        let mut commits_validator =
+            CommitsValidator::new(ui, tx.base_workspace_helper(), remote, args)?;
         for (name, targets) in view.local_remote_bookmarks(remote) {
             if targets.local_target.is_present() {
                 continue;
             }
+            let remote_symbol = name.to_remote_symbol(remote);
             let allow_new = false; // doesn't matter
             let allow_delete = true;
-            match classify_bookmark_update(
-                name.to_remote_symbol(remote),
-                targets,
-                allow_new,
-                allow_delete,
-            ) {
-                Ok(Some(update)) => bookmark_updates.push((name.to_owned(), update)),
+            match classify_bookmark_update(remote_symbol, targets, allow_new, allow_delete) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.bookmarks.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_bookmark(ui, tx.base_workspace_helper(), name)?,
+                },
+                Ok(None) => {}
+                Err(reason) => reason.print(ui)?,
+            }
+        }
+        for (name, targets) in view.local_remote_tags(remote) {
+            if targets.local_target.is_present() {
+                continue;
+            }
+            let remote_symbol = name.to_remote_symbol(remote);
+            let allow_new = false; // doesn't matter
+            let allow_delete = true;
+            match classify_tag_update(remote_symbol, targets, allow_new, allow_delete) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.tags.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_tag(ui, tx.base_workspace_helper(), name)?,
+                },
                 Ok(None) => {}
                 Err(reason) => reason.print(ui)?,
             }
         }
         tx_description = format!(
-            "{TX_DESC_PUSH}all deleted bookmarks to git remote {remote}",
+            "{TX_DESC_PUSH}all deleted bookmarks/tags to git remote {remote}",
             remote = remote.as_symbol()
         );
     } else {
         let mut seen_bookmarks: HashSet<&RefName> = HashSet::new();
+        let mut seen_tags: HashSet<&RefName> = HashSet::new();
 
         // --change and --named don't move existing bookmarks. If they did, be
         // careful to not select old state by -r/--revisions and bookmark names.
@@ -360,7 +435,7 @@ pub async fn cmd_git_push(
             let allow_new = true; // --change implies creation of remote bookmark
             let allow_delete = false; // doesn't matter
             match classify_bookmark_update(remote_symbol, targets, allow_new, allow_delete) {
-                Ok(Some(update)) => bookmark_updates.push((name.to_owned(), update)),
+                Ok(Some(update)) => ref_updates.bookmarks.push((name.to_owned(), update)),
                 Ok(None) => writeln!(
                     ui.status(),
                     "Bookmark {remote_symbol} already matches {name}",
@@ -371,8 +446,6 @@ pub async fn cmd_git_push(
         }
 
         let view = tx.repo().view();
-        // TODO: Delete in jj 0.42.0+
-        let allow_new = args.allow_new || tx.settings().get("git.push-new-bookmarks")?;
         let bookmarks_by_name = find_bookmarks_to_push(ui, view, &args.bookmark, remote)?;
         for &(name, targets) in &bookmarks_by_name {
             if !seen_bookmarks.insert(name) {
@@ -382,10 +455,10 @@ pub async fn cmd_git_push(
             // Override allow_new if the bookmark is not tracked with any remote
             // already. The user has specified --bookmark, so their intent which
             // bookmarks to push is clear.
-            let allow_new = allow_new || !has_tracked_remote_bookmarks(tx.repo(), name);
+            let allow_new = !has_tracked_remote_bookmarks(tx.repo(), name);
             let allow_delete = true; // named explicitly, allow delete without --delete
             match classify_bookmark_update(remote_symbol, targets, allow_new, allow_delete) {
-                Ok(Some(update)) => bookmark_updates.push((name.to_owned(), update)),
+                Ok(Some(update)) => ref_updates.bookmarks.push((name.to_owned(), update)),
                 Ok(None) => writeln!(
                     ui.status(),
                     "Bookmark {remote_symbol} already matches {name}",
@@ -395,27 +468,72 @@ pub async fn cmd_git_push(
             }
         }
 
+        let tags_by_name = find_tags_to_push(ui, view, &args.tag, remote)?;
+        for &(name, targets) in &tags_by_name {
+            if !seen_tags.insert(name) {
+                continue;
+            }
+            let remote_symbol = name.to_remote_symbol(remote);
+            // named explicitly, allow track or delete
+            let allow_new = !has_tracked_remote_tags(tx.repo(), name);
+            let allow_delete = true;
+            match classify_tag_update(remote_symbol, targets, allow_new, allow_delete) {
+                Ok(Some(update)) => ref_updates.tags.push((name.to_owned(), update)),
+                Ok(None) => writeln!(
+                    ui.status(),
+                    "Tag {remote_symbol} already matches {name}",
+                    name = name.as_symbol()
+                )?,
+                Err(reason) => return Err(reason.into()),
+            }
+        }
+
+        let mut commits_validator =
+            CommitsValidator::new(ui, tx.base_workspace_helper(), remote, args)?;
+        // Error out if explicitly-specified targets can't be pushed.
+        commits_validator
+            .validate_updates(&ref_updates)
+            .await?
+            .map_err(|reason| reason.to_command_error(tx.base_workspace_helper()))?;
+
         let use_default_revset = args.bookmark.is_empty()
+            && args.tag.is_empty()
             && args.change.is_empty()
             && args.revisions.is_empty()
             && args.named.is_empty();
         let target_revisions = if use_default_revset {
             find_default_target_revisions(ui, tx.base_workspace_helper(), remote).await?
         } else {
-            find_bookmarked_revisions(ui, tx.base_workspace_helper(), &args.revisions).await?
+            find_target_revisions(ui, tx.base_workspace_helper(), &args.revisions).await?
         };
         for (name, targets) in tx.base_repo().view().local_remote_bookmarks(remote) {
             if !matches_local_target(targets, &target_revisions) || !seen_bookmarks.insert(name) {
                 continue;
             }
+            let remote_symbol = name.to_remote_symbol(remote);
+            let allow_new = false;
             let allow_delete = false;
-            match classify_bookmark_update(
-                name.to_remote_symbol(remote),
-                targets,
-                allow_new,
-                allow_delete,
-            ) {
-                Ok(Some(update)) => bookmark_updates.push((name.to_owned(), update)),
+            match classify_bookmark_update(remote_symbol, targets, allow_new, allow_delete) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.bookmarks.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_bookmark(ui, tx.base_workspace_helper(), name)?,
+                },
+                Ok(None) => {}
+                Err(reason) => reason.print(ui)?,
+            }
+        }
+        for (name, targets) in tx.base_repo().view().local_remote_tags(remote) {
+            if !matches_local_target(targets, &target_revisions) || !seen_tags.insert(name) {
+                continue;
+            }
+            let remote_symbol = name.to_remote_symbol(remote);
+            let allow_new = false;
+            let allow_delete = false;
+            match classify_tag_update(remote_symbol, targets, allow_new, allow_delete) {
+                Ok(Some(update)) => match commits_validator.validate_update(&update).await? {
+                    Ok(()) => ref_updates.tags.push((name.to_owned(), update)),
+                    Err(reason) => reason.print_tag(ui, tx.base_workspace_helper(), name)?,
+                },
                 Ok(None) => {}
                 Err(reason) => reason.print(ui)?,
             }
@@ -423,21 +541,18 @@ pub async fn cmd_git_push(
 
         tx_description = format!(
             "{TX_DESC_PUSH}{names} to git remote {remote}",
-            names = make_bookmark_term(&bookmark_updates),
+            names = make_updates_term(&ref_updates),
             remote = remote.as_symbol()
         );
     }
-    if bookmark_updates.is_empty() {
+    if ref_updates.bookmarks.is_empty() && ref_updates.tags.is_empty() {
         writeln!(ui.status(), "Nothing changed.")?;
         return Ok(());
     }
 
-    let to_push_expr = ready_to_push_revset_expression(&tx, remote, &bookmark_updates);
-    validate_commits_ready_to_push(ui, tx.base_workspace_helper(), to_push_expr.clone(), args)
-        .await?;
     if !args.dry_run && tx.settings().get_bool("git.sign-on-push")? {
-        bookmark_updates =
-            sign_commits_before_push(ui, &mut tx, to_push_expr, bookmark_updates).await?;
+        let to_push_expr = ready_to_push_revset_expression(&tx, remote, &ref_updates);
+        ref_updates = sign_commits_before_push(ui, &mut tx, to_push_expr, ref_updates).await?;
     }
 
     if let Some(mut formatter) = ui.status_formatter() {
@@ -446,7 +561,7 @@ pub async fn cmd_git_push(
             "Changes to push to {remote}:",
             remote = remote.as_symbol()
         )?;
-        print_commits_ready_to_push(formatter.as_mut(), tx.repo(), &bookmark_updates)?;
+        print_commits_ready_to_push(formatter.as_mut(), tx.repo(), &ref_updates)?;
     }
 
     if args.dry_run {
@@ -454,19 +569,15 @@ pub async fn cmd_git_push(
         return Ok(());
     }
 
-    let targets = GitPushRefTargets {
-        bookmarks: bookmark_updates,
-    };
     let git_settings = GitSettings::from_settings(tx.settings())?;
     let options = GitPushOptions {
-        extra_args: vec![],
         remote_push_options: args.option.clone(),
     };
     let push_stats = git::push_refs(
         tx.repo_mut(),
         git_settings.to_subprocess_options(),
         remote,
-        &targets,
+        &ref_updates,
         &mut GitSubprocessUi::new(ui),
         &options,
     )?;
@@ -483,15 +594,194 @@ pub async fn cmd_git_push(
     }
 }
 
+#[derive(Clone, Debug)]
+struct RejectedCommitReason {
+    commit: Commit,
+    message: String,
+    hint: Option<String>,
+}
+
+impl RejectedCommitReason {
+    fn print_bookmark(
+        &self,
+        ui: &Ui,
+        workspace_helper: &WorkspaceCommandHelper,
+        name: &RefName,
+    ) -> io::Result<()> {
+        self.print_inner(ui, workspace_helper, "bookmark", name)
+    }
+
+    fn print_tag(
+        &self,
+        ui: &Ui,
+        workspace_helper: &WorkspaceCommandHelper,
+        name: &RefName,
+    ) -> io::Result<()> {
+        self.print_inner(ui, workspace_helper, "tag", name)
+    }
+
+    fn print_inner(
+        &self,
+        ui: &Ui,
+        workspace_helper: &WorkspaceCommandHelper,
+        kind: &str,
+        name: &RefName,
+    ) -> io::Result<()> {
+        writeln!(
+            ui.warning_default(),
+            "Won't push {kind} {name}: commit {id} {message}",
+            name = name.as_symbol(),
+            id = short_commit_hash(self.commit.id()),
+            message = self.message,
+        )?;
+        if let Some(mut formatter) = ui.status_formatter() {
+            write!(formatter, "  ")?;
+            workspace_helper.write_commit_summary(formatter.as_mut(), &self.commit)?;
+            writeln!(formatter)?;
+        }
+        if let Some(hint) = &self.hint {
+            writeln!(ui.hint_default(), "{hint}")?;
+        }
+        Ok(())
+    }
+
+    fn to_command_error(&self, workspace_helper: &WorkspaceCommandHelper) -> CommandError {
+        let mut error = user_error(format!(
+            "Won't push commit {id} since it {message}",
+            id = short_commit_hash(self.commit.id()),
+            message = self.message,
+        ));
+        error.add_formatted_hint_with(|formatter| {
+            write!(formatter, "Rejected commit: ")?;
+            workspace_helper.write_commit_summary(formatter, &self.commit)?;
+            Ok(())
+        });
+        error.extend_hints(self.hint.clone());
+        error
+    }
+}
+
+/// Validates that the commits that will be pushed are ready (have authorship
+/// information, are not conflicted, etc.).
+struct CommitsValidator<'repo> {
+    repo: &'repo dyn Repo,
+    known_heads: Vec<CommitId>,
+    immutable_heads: Arc<ResolvedRevsetExpression>,
+    private_commits: Option<(String, Box<RevsetContainingFn<'repo>>)>,
+    allow_empty_description: bool,
+}
+
+impl<'repo> CommitsValidator<'repo> {
+    fn new(
+        ui: &Ui,
+        workspace_helper: &'repo WorkspaceCommandHelper,
+        remote: &RemoteName,
+        args: &GitPushArgs,
+    ) -> Result<Self, CommandError> {
+        let repo = workspace_helper.repo().as_ref();
+        let known_heads = repo
+            .view()
+            .remote_bookmarks(remote)
+            .flat_map(|(_, old_head)| old_head.target.added_ids())
+            .cloned()
+            .collect();
+        let immutable_heads = workspace_helper
+            .attach_revset_evaluator(workspace_helper.env().immutable_heads_expression().clone())
+            .resolve()?;
+        let private_commits = if !args.allow_private {
+            let settings = workspace_helper.settings();
+            let revset_str = settings.get_string("git.private-commits")?;
+            let is_private = workspace_helper
+                .parse_revset(ui, &RevisionArg::from(revset_str.clone()))?
+                .evaluate()?
+                .containing_fn();
+            Some((revset_str, is_private))
+        } else {
+            None
+        };
+        Ok(Self {
+            repo,
+            known_heads,
+            immutable_heads,
+            private_commits,
+            allow_empty_description: args.allow_empty_description,
+        })
+    }
+
+    async fn validate_update(
+        &mut self,
+        update: &Diff<Option<CommitId>>,
+    ) -> Result<Result<(), RejectedCommitReason>, RevsetEvaluationError> {
+        self.validate_commits(update.after.as_slice()).await
+    }
+
+    async fn validate_updates(
+        &mut self,
+        updates: &GitPushRefTargets,
+    ) -> Result<Result<(), RejectedCommitReason>, RevsetEvaluationError> {
+        let new_heads = itertools::chain(&updates.bookmarks, &updates.tags)
+            .filter_map(|(_, update)| update.after.clone())
+            .collect_vec();
+        self.validate_commits(&new_heads).await
+    }
+
+    async fn validate_commits(
+        &mut self,
+        new_heads: &[CommitId],
+    ) -> Result<Result<(), RejectedCommitReason>, RevsetEvaluationError> {
+        let new_commits = RevsetExpression::commits(self.known_heads.clone())
+            .union(&self.immutable_heads)
+            .range(&RevsetExpression::commits(new_heads.to_vec()));
+        let mut commit_stream = new_commits
+            .evaluate(self.repo)?
+            .stream()
+            .commits(self.repo.store());
+        while let Some(commit) = commit_stream.try_next().await? {
+            let mut reasons = vec![];
+            let mut hint = None;
+            if commit.description().is_empty() && !self.allow_empty_description {
+                reasons.push("has no description");
+            }
+            if commit.author().name.is_empty()
+                || commit.author().email.is_empty()
+                || commit.committer().name.is_empty()
+                || commit.committer().email.is_empty()
+            {
+                reasons.push("has no author and/or committer set");
+            }
+            if commit.has_conflict() {
+                reasons.push("has conflicts");
+            }
+            if let Some((revset_str, is_private)) = &self.private_commits
+                && is_private(commit.id())?
+            {
+                reasons.push("is private");
+                hint = Some(format!("Configured git.private-commits: '{revset_str}'"));
+            }
+            if reasons.is_empty() {
+                continue;
+            }
+            return Ok(Err(RejectedCommitReason {
+                commit,
+                message: reasons.join(" and "),
+                hint,
+            }));
+        }
+
+        // No need to validate ancestors again
+        self.known_heads.extend(new_heads.iter().cloned());
+        Ok(Ok(()))
+    }
+}
+
 fn ready_to_push_revset_expression(
     tx: &WorkspaceCommandTransaction,
     remote: &RemoteName,
-    bookmark_updates: &[(RefNameBuf, Diff<Option<CommitId>>)],
+    ref_updates: &GitPushRefTargets,
 ) -> Arc<UserRevsetExpression> {
     let workspace_helper = tx.base_workspace_helper();
     let repo = workspace_helper.repo();
-    let new_heads = bookmark_updates
-        .iter()
+    let new_heads = itertools::chain(&ref_updates.bookmarks, &ref_updates.tags)
         .filter_map(|(_, update)| update.after.clone())
         .collect_vec();
     let old_heads = repo
@@ -505,65 +795,6 @@ fn ready_to_push_revset_expression(
         .range(&RevsetExpression::commits(new_heads))
 }
 
-/// Validates that the commits that will be pushed are ready (have authorship
-/// information, are not conflicted, etc.).
-async fn validate_commits_ready_to_push(
-    ui: &Ui,
-    workspace_helper: &WorkspaceCommandHelper,
-    commits_to_push: Arc<UserRevsetExpression>,
-    args: &GitPushArgs,
-) -> Result<(), CommandError> {
-    let settings = workspace_helper.settings();
-    let private_revset_str = RevisionArg::from(settings.get_string("git.private-commits")?);
-    let is_private = workspace_helper
-        .parse_revset(ui, &private_revset_str)?
-        .evaluate()?
-        .containing_fn();
-
-    let mut commit_stream = workspace_helper
-        .attach_revset_evaluator(commits_to_push)
-        .evaluate_to_commits()?;
-    while let Some(commit) = commit_stream.try_next().await? {
-        let mut reasons = vec![];
-        if commit.description().is_empty() && !args.allow_empty_description {
-            reasons.push("it has no description");
-        }
-        if commit.author().name.is_empty()
-            || commit.author().email.is_empty()
-            || commit.committer().name.is_empty()
-            || commit.committer().email.is_empty()
-        {
-            reasons.push("it has no author and/or committer set");
-        }
-        if commit.has_conflict() {
-            reasons.push("it has conflicts");
-        }
-        let is_private = is_private(commit.id())?;
-        if !args.allow_private && is_private {
-            reasons.push("it is private");
-        }
-        if !reasons.is_empty() {
-            let mut error = user_error(format!(
-                "Won't push commit {} since {}",
-                short_commit_hash(commit.id()),
-                reasons.join(" and ")
-            ));
-            error.add_formatted_hint_with(|formatter| {
-                write!(formatter, "Rejected commit: ")?;
-                workspace_helper.write_commit_summary(formatter, &commit)?;
-                Ok(())
-            });
-            if !args.allow_private && is_private {
-                error.add_hint(format!(
-                    "Configured git.private-commits: '{private_revset_str}'",
-                ));
-            }
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
 /// Signs commits before pushing.
 ///
 /// Returns the updated list of bookmark names and corresponding
@@ -572,8 +803,8 @@ async fn sign_commits_before_push(
     ui: &Ui,
     tx: &mut WorkspaceCommandTransaction<'_>,
     commits_to_push: Arc<UserRevsetExpression>,
-    bookmark_updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)>,
-) -> Result<Vec<(RefNameBuf, Diff<Option<CommitId>>)>, CommandError> {
+    ref_updates: GitPushRefTargets,
+) -> Result<GitPushRefTargets, CommandError> {
     let mut sign_settings = tx.settings().sign_settings();
     sign_settings.behavior = SignBehavior::Own;
     let commit_ids: IndexSet<CommitId> = tx
@@ -588,7 +819,7 @@ async fn sign_commits_before_push(
         .try_collect()
         .await?;
     if commit_ids.is_empty() {
-        return Ok(bookmark_updates);
+        return Ok(ref_updates);
     }
 
     let mut old_to_new_commits_map: HashMap<CommitId, CommitId> = HashMap::new();
@@ -625,20 +856,19 @@ async fn sign_commits_before_push(
             .await?;
     }
 
-    let bookmark_updates = bookmark_updates
-        .into_iter()
-        .map(|(bookmark_name, update)| {
-            (
-                bookmark_name,
-                Diff {
-                    before: update.before,
-                    after: update
-                        .after
-                        .map(|id| old_to_new_commits_map.get(&id).cloned().unwrap_or(id)),
-                },
-            )
-        })
-        .collect_vec();
+    let map_to_new_commits = |updates: Vec<(RefNameBuf, Diff<Option<CommitId>>)>| {
+        updates
+            .into_iter()
+            .map(|(name, Diff { before, after })| {
+                let after = after.map(|id| old_to_new_commits_map.get(&id).cloned().unwrap_or(id));
+                (name, Diff { before, after })
+            })
+            .collect()
+    };
+    let ref_updates = GitPushRefTargets {
+        bookmarks: map_to_new_commits(ref_updates.bookmarks),
+        tags: map_to_new_commits(ref_updates.tags),
+    };
 
     if let Some(mut formatter) = ui.status_formatter() {
         let num_updated_signatures = commit_ids.len();
@@ -654,13 +884,13 @@ async fn sign_commits_before_push(
         }
     }
 
-    Ok(bookmark_updates)
+    Ok(ref_updates)
 }
 
 fn print_commits_ready_to_push(
     formatter: &mut dyn Formatter,
     repo: &dyn Repo,
-    bookmark_updates: &[(RefNameBuf, Diff<Option<CommitId>>)],
+    ref_updates: &GitPushRefTargets,
 ) -> Result<(), CommandError> {
     let to_direction =
         |old_target: &CommitId, new_target: &CommitId| -> IndexResult<BookmarkMoveDirection> {
@@ -673,51 +903,51 @@ fn print_commits_ready_to_push(
                 Ok(BookmarkMoveDirection::Sideways)
             }
         };
-
-    for (bookmark_name, update) in bookmark_updates {
-        match (&update.before, &update.after) {
+    let describe_update = |update: &Diff<Option<CommitId>>| -> IndexResult<String> {
+        let desc = match (&update.before, &update.after) {
             (Some(old_target), Some(new_target)) => {
-                let bookmark_name = bookmark_name.as_symbol();
                 let old = short_commit_hash(old_target);
                 let new = short_commit_hash(new_target);
-                // TODO(ilyagr): Add color. Once there is color, "Move bookmark ... sideways"
-                // may read more naturally than "Move sideways bookmark ...".
-                // Without color, it's hard to see at a glance if one bookmark
-                // among many was moved sideways (say). TODO: People on Discord
-                // suggest "Move bookmark ... forward by n commits",
-                // possibly "Move bookmark ... sideways (X forward, Y back)".
-                let msg = match to_direction(old_target, new_target)? {
+                // TODO: People on Discord suggest "... forward by n commits",
+                // possibly "... sideways (X forward, Y back)".
+                match to_direction(old_target, new_target)? {
                     BookmarkMoveDirection::Forward => {
-                        format!("Move forward bookmark {bookmark_name} from {old} to {new}")
+                        format!("move forward from {old} to {new}")
                     }
                     BookmarkMoveDirection::Backward => {
-                        format!("Move backward bookmark {bookmark_name} from {old} to {new}")
+                        format!("move backward from {old} to {new}")
                     }
                     BookmarkMoveDirection::Sideways => {
-                        format!("Move sideways bookmark {bookmark_name} from {old} to {new}")
+                        format!("move sideways from {old} to {new}")
                     }
-                };
-                writeln!(formatter, "  {msg}")?;
+                }
             }
             (Some(old_target), None) => {
-                writeln!(
-                    formatter,
-                    "  Delete bookmark {bookmark_name} from {old}",
-                    bookmark_name = bookmark_name.as_symbol(),
-                    old = short_commit_hash(old_target)
-                )?;
+                format!("delete from {old}", old = short_commit_hash(old_target))
             }
             (None, Some(new_target)) => {
-                writeln!(
-                    formatter,
-                    "  Add bookmark {bookmark_name} to {new}",
-                    bookmark_name = bookmark_name.as_symbol(),
-                    new = short_commit_hash(new_target)
-                )?;
+                format!("add to {new}", new = short_commit_hash(new_target))
             }
             (None, None) => {
-                panic!("Not pushing any change to bookmark {bookmark_name:?}");
+                panic!("Not pushing any change");
             }
+        };
+        Ok(desc)
+    };
+
+    // TODO: Add color
+    let kind_updates = [
+        ("bookmark", &ref_updates.bookmarks),
+        ("tag", &ref_updates.tags),
+    ];
+    for (kind, updates) in kind_updates {
+        for (name, update) in updates {
+            let desc = describe_update(update)?;
+            writeln!(
+                formatter,
+                "  {kind}: {name} [{desc}]",
+                name = name.as_symbol()
+            )?;
         }
     }
     Ok(())
@@ -746,12 +976,12 @@ fn get_default_push_remote(
 }
 
 #[derive(Clone, Debug)]
-struct RejectedBookmarkUpdateReason {
+struct RejectedRefUpdateReason {
     message: String,
     hint: Option<String>,
 }
 
-impl RejectedBookmarkUpdateReason {
+impl RejectedRefUpdateReason {
     fn print(&self, ui: &Ui) -> io::Result<()> {
         writeln!(ui.warning_default(), "{}", self.message)?;
         if let Some(hint) = &self.hint {
@@ -761,9 +991,9 @@ impl RejectedBookmarkUpdateReason {
     }
 }
 
-impl From<RejectedBookmarkUpdateReason> for CommandError {
-    fn from(reason: RejectedBookmarkUpdateReason) -> Self {
-        let RejectedBookmarkUpdateReason { message, hint } = reason;
+impl From<RejectedRefUpdateReason> for CommandError {
+    fn from(reason: RejectedRefUpdateReason) -> Self {
+        let RejectedRefUpdateReason { message, hint } = reason;
         let mut cmd_err = user_error(message);
         cmd_err.extend_hints(hint);
         cmd_err
@@ -775,11 +1005,11 @@ fn classify_bookmark_update(
     targets: LocalAndRemoteRef,
     allow_new: bool,
     allow_delete: bool,
-) -> Result<Option<Diff<Option<CommitId>>>, RejectedBookmarkUpdateReason> {
+) -> Result<Option<Diff<Option<CommitId>>>, RejectedRefUpdateReason> {
     let push_action = classify_ref_push_action(targets);
     match push_action {
         RefPushAction::AlreadyMatches => Ok(None),
-        RefPushAction::LocalConflicted => Err(RejectedBookmarkUpdateReason {
+        RefPushAction::LocalConflicted => Err(RejectedRefUpdateReason {
             message: format!(
                 "Bookmark {name} is conflicted",
                 name = remote_symbol.name.as_symbol()
@@ -789,11 +1019,11 @@ fn classify_bookmark_update(
                     .to_owned(),
             ),
         }),
-        RefPushAction::RemoteConflicted => Err(RejectedBookmarkUpdateReason {
+        RefPushAction::RemoteConflicted => Err(RejectedRefUpdateReason {
             message: format!("Bookmark {remote_symbol} is conflicted"),
             hint: Some("Run `jj git fetch` to update the conflicted remote bookmark.".to_owned()),
         }),
-        RefPushAction::RemoteUntracked => Err(RejectedBookmarkUpdateReason {
+        RefPushAction::RemoteUntracked => Err(RejectedRefUpdateReason {
             message: format!("Non-tracking remote bookmark {remote_symbol} exists"),
             hint: Some(format!(
                 "Run `jj bookmark track {name} --remote={remote}` to import the remote bookmark.",
@@ -801,10 +1031,8 @@ fn classify_bookmark_update(
                 remote = remote_symbol.remote.as_symbol()
             )),
         }),
-        // TODO: deprecate --allow-new and make classify_bookmark_push_action()
-        // reject untracked remote?
         RefPushAction::Update(_) if !targets.remote_ref.is_tracked() && !allow_new => {
-            Err(RejectedBookmarkUpdateReason {
+            Err(RejectedRefUpdateReason {
                 message: format!("Refusing to create new remote bookmark {remote_symbol}"),
                 hint: Some(format!(
                     "Run `jj bookmark track {name} --remote={remote}` and try again.",
@@ -814,7 +1042,7 @@ fn classify_bookmark_update(
             })
         }
         RefPushAction::Update(update) if update.after.is_none() && !allow_delete => {
-            Err(RejectedBookmarkUpdateReason {
+            Err(RejectedRefUpdateReason {
                 message: format!(
                     "Refusing to push deleted bookmark {name}",
                     name = remote_symbol.name.as_symbol(),
@@ -824,6 +1052,54 @@ fn classify_bookmark_update(
                      this warning."
                         .to_owned(),
                 ),
+            })
+        }
+        RefPushAction::Update(update) => Ok(Some(update)),
+    }
+}
+
+fn classify_tag_update(
+    remote_symbol: RemoteRefSymbol<'_>,
+    targets: LocalAndRemoteRef<'_>,
+    allow_new: bool,
+    allow_delete: bool,
+) -> Result<Option<Diff<Option<CommitId>>>, RejectedRefUpdateReason> {
+    let push_action = classify_ref_push_action(targets);
+    match push_action {
+        RefPushAction::AlreadyMatches => Ok(None),
+        RefPushAction::LocalConflicted => Err(RejectedRefUpdateReason {
+            message: format!(
+                "Tag {name} is conflicted",
+                name = remote_symbol.name.as_symbol()
+            ),
+            hint: Some(
+                "Run `jj tag list` to inspect, and use `jj tag set` to fix it up.".to_owned(),
+            ),
+        }),
+        RefPushAction::RemoteConflicted => Err(RejectedRefUpdateReason {
+            message: format!("Tag {remote_symbol} is conflicted"),
+            hint: Some("Run `jj git fetch` to update the conflicted remote tag.".to_owned()),
+        }),
+        RefPushAction::RemoteUntracked => Err(RejectedRefUpdateReason {
+            message: format!("Non-tracking remote tag {remote_symbol} exists"),
+            // No suggestion because tags are tracked by default
+            hint: None,
+        }),
+        RefPushAction::Update(_) if !targets.remote_ref.is_tracked() && !allow_new => {
+            Err(RejectedRefUpdateReason {
+                message: format!("Refusing to create new remote tag {remote_symbol}"),
+                // TODO: suggest `jj tag track`?
+                hint: None,
+            })
+        }
+        RefPushAction::Update(update) if update.after.is_none() && !allow_delete => {
+            Err(RejectedRefUpdateReason {
+                message: format!(
+                    "Refusing to push deleted tag {name}",
+                    name = remote_symbol.name.as_symbol(),
+                ),
+                // TODO: suggest `jj tag forget`?
+                hint: Some("Push deleted tags with --deleted.".to_owned()),
             })
         }
         RefPushAction::Update(update) => Ok(Some(update)),
@@ -888,13 +1164,14 @@ async fn create_change_bookmarks(
         return Ok(vec![]);
     }
 
-    let all_commits: Vec<_> = tx
-        .base_workspace_helper()
-        .resolve_some_revsets(ui, changes)
-        .await?
-        .iter()
-        .map(|id| tx.repo().store().get_commit(id))
-        .try_collect()?;
+    let all_commits = try_join_all(
+        tx.base_workspace_helper()
+            .resolve_some_revsets(ui, changes)
+            .await?
+            .iter()
+            .map(|id| tx.repo().store().get_commit_async(id)),
+    )
+    .await?;
     let bookmark_names: Vec<_> = {
         let template_text = tx.settings().get_string("templates.git_push_bookmark")?;
         let template = tx.parse_commit_template(ui, &template_text)?;
@@ -966,22 +1243,70 @@ fn find_bookmarks_to_push<'a>(
     Ok(matching_bookmarks)
 }
 
+fn find_tags_to_push<'a>(
+    ui: &Ui,
+    view: &'a View,
+    tag_patterns: &[String],
+    remote: &RemoteName,
+) -> Result<Vec<(&'a RefName, LocalAndRemoteRef<'a>)>, CommandError> {
+    let tag_expr = parse_union_name_patterns(ui, tag_patterns)?;
+    let tag_matcher = tag_expr.to_matcher();
+    let matching_tags = view
+        .local_remote_tags_matching(&tag_matcher, remote)
+        .filter(|(_, targets)| {
+            // If the remote exists but is not tracked, the absent local shouldn't
+            // be considered a deleted tag.
+            targets.local_target.is_present() || targets.remote_ref.is_tracked()
+        })
+        .collect();
+    let mut unmatched_names = tag_expr
+        .exact_strings()
+        .map(RefName::new)
+        .filter(|&name| {
+            let symbol = name.to_remote_symbol(remote);
+            view.get_local_tag(name).is_absent() && !view.get_remote_tag(symbol).is_tracked()
+        })
+        .peekable();
+    if unmatched_names.peek().is_some() {
+        writeln!(
+            ui.warning_default(),
+            "No matching tags for names: {}",
+            unmatched_names.map(|name| name.as_symbol()).join(", ")
+        )?;
+    }
+    Ok(matching_tags)
+}
+
 async fn find_default_target_revisions(
     ui: &Ui,
     workspace_command: &WorkspaceCommandHelper,
     remote: &RemoteName,
 ) -> Result<HashSet<CommitId>, CommandError> {
-    // remote_bookmarks(remote=<remote>)..@
-    let workspace_name = workspace_command.workspace_name();
-    let expression = RevsetExpression::remote_bookmarks(
-        RemoteRefSymbolExpression {
-            name: StringExpression::all(),
-            remote: StringExpression::exact(remote),
+    // Get the default revset specified by the user.
+    let push_revset = workspace_command
+        .settings()
+        .get_string("revsets.git-push")?;
+    let mut context = workspace_command.env().revset_parse_context();
+    context.local_variables.insert(
+        "remote",
+        ExpressionNode {
+            kind: ExpressionKind::Pattern(Box::new(PatternNode {
+                name: "exact",
+                name_span: Span::new("exact", 0, 1).expect("programmatic span shouldn't fail"),
+                value: ExpressionNode {
+                    kind: ExpressionKind::String(remote.as_str().to_string()),
+                    span: Span::new(remote.as_str(), 0, remote.as_str().len())
+                        .expect("programmatic span shouldn't fail"),
+                },
+            })),
+            span: Span::new(remote.as_str(), 0, remote.as_str().len())
+                .expect("programmatic span shouldn't fail"),
         },
-        None,
-    )
-    .range(&RevsetExpression::working_copy(workspace_name.to_owned()))
-    .intersection(&RevsetExpression::bookmarks(StringExpression::all()));
+    );
+    let mut diags = RevsetDiagnostics::default();
+    let mut expression = revset::parse(&mut diags, &push_revset, &context)?;
+    print_parse_diagnostics(ui, "In revsets.git-push", &diags)?;
+    expression = expression.intersection(&RevsetExpression::bookmarks(StringExpression::all()));
     let commit_ids = workspace_command
         .attach_revset_evaluator(expression)
         .evaluate_to_commit_ids()?
@@ -990,14 +1315,13 @@ async fn find_default_target_revisions(
     if commit_ids.as_mut().peek().await.is_none() {
         writeln!(
             ui.warning_default(),
-            "No bookmarks found in the default push revset: remote_bookmarks(remote={remote})..@",
-            remote = remote.as_symbol()
+            "No bookmarks/tags found in the push revset: {push_revset}"
         )?;
     }
     Ok(commit_ids.try_collect().await?)
 }
 
-async fn find_bookmarked_revisions(
+async fn find_target_revisions(
     ui: &Ui,
     workspace_command: &WorkspaceCommandHelper,
     revisions: &[RevisionArg],
@@ -1005,13 +1329,16 @@ async fn find_bookmarked_revisions(
     let mut revision_commit_ids = HashSet::new();
     for rev_arg in revisions {
         let mut expression = workspace_command.parse_revset(ui, rev_arg)?;
-        expression.intersect_with(&RevsetExpression::bookmarks(StringExpression::all()));
+        expression.intersect_with(
+            &RevsetExpression::bookmarks(StringExpression::all())
+                .union(&RevsetExpression::tags(StringExpression::all())),
+        );
         let commit_ids = expression.evaluate_to_commit_ids()?.peekable();
         let mut commit_ids = std::pin::pin!(commit_ids);
         if commit_ids.as_mut().as_mut().peek().await.is_none() {
             writeln!(
                 ui.warning_default(),
-                "No bookmarks point to the specified revisions: {rev_arg}"
+                "No bookmarks/tags point to the specified revisions: {rev_arg}"
             )?;
         }
         while let Some(commit_id) = commit_ids.try_next().await? {
